@@ -6,7 +6,7 @@ const std = @import("std");
 // for defining build steps and express dependencies between them, allowing the
 // build runner to parallelize the build automatically (and the cache system to
 // know when a step doesn't need to be re-run).
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     // Standard target options allow the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
@@ -21,25 +21,27 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
-    // This creates a module, which represents a collection of source files alongside
-    // some compilation options, such as optimization mode and linked system libraries.
-    // Zig modules are the preferred way of making Zig code available to consumers.
-    // addModule defines a module that we intend to make available for importing
-    // to our consumers. We must give it a name because a Zig package can expose
-    // multiple modules and consumers will need to be able to specify which
-    // module they want to access.
-    // const mod = b.addModule("vaultclient", .{
-    //     // The root source file is the "entry point" of this module. Users of
-    //     // this module will only be able to access public declarations contained
-    //     // in this file, which means that if you have declarations that you
-    //     // intend to expose to consumers that were defined in other files part
-    //     // of this module, you will have to make sure to re-export them from
-    //     // the root file.
-    //     .root_source_file = b.path("src/root.zig"),
-    //     // Later on we'll use this module as the root module of a test executable
-    //     // which requires us to specify a target.
-    //     .target = target,
-    // });
+    const bearssl_dep = b.dependency("bearssl", .{});
+    const bearssl = b.addLibrary(.{
+        .name = "bearssl",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize }),
+    });
+
+    bearssl.root_module.addIncludePath(bearssl_dep.path("inc"));
+    bearssl.root_module.addIncludePath(bearssl_dep.path("src"));
+
+    var dir = try bearssl_dep.path("src").getPath3(b, null).openDir("", .{ .iterate = true });
+    defer dir.close();
+    var walker = try dir.walk(b.allocator);
+    defer walker.deinit();
+
+    while (try walker.next()) |entry| {
+        if (std.mem.endsWith(u8, entry.basename, ".c")) {
+            const path = try entry.dir.realpathAlloc(b.allocator, entry.basename);
+            bearssl.root_module.addCSourceFile(.{ .file = .{ .cwd_relative = path } });
+            b.allocator.free(path);
+        }
+    }
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -70,18 +72,11 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
-            // List of modules available for import in source files part of the
-            // root module.
-            // .imports = &.{
-            //     // Here "vaultclient" is the name you will use in your source code to
-            //     // import this module (e.g. `@import("vaultclient")`). The name is
-            //     // repeated because you are allowed to rename your imports, which
-            //     // can be extremely useful in case of collisions (which can happen
-            //     // importing modules from different packages).
-            //     .{ .name = "vaultclient", .module = mod },
-            // },
         }),
     });
+
+    exe.root_module.linkLibrary(bearssl);
+    exe.root_module.addIncludePath(bearssl_dep.path("inc"));
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
@@ -115,16 +110,6 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    // Creates an executable that will run `test` blocks from the provided module.
-    // Here `mod` needs to define a target, which is why earlier we made sure to
-    // set the releative field.
-    // const mod_tests = b.addTest(.{
-    //     .root_module = mod,
-    // });
-
-    // A run step that will run the test executable.
-    // const run_mod_tests = b.addRunArtifact(mod_tests);
-
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
     // hence why we have to create two separate ones.
@@ -139,7 +124,6 @@ pub fn build(b: *std.Build) void {
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
-    // test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
