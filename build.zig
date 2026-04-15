@@ -21,25 +21,57 @@ pub fn build(b: *std.Build) !void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
-    const bearssl_dep = b.dependency("bearssl", .{});
-    const bearssl = b.addLibrary(.{
-        .name = "bearssl",
+    const math_dep = b.dependency("tomsfastmath", .{});
+    const math = b.addLibrary(.{
+        .name = "tomsfastmath",
         .root_module = b.createModule(.{ .target = target, .optimize = optimize }),
     });
 
-    bearssl.root_module.addIncludePath(bearssl_dep.path("inc"));
-    bearssl.root_module.addIncludePath(bearssl_dep.path("src"));
+    math.root_module.addIncludePath(math_dep.path("src/headers"));
 
-    var dir = try bearssl_dep.path("src").getPath3(b, null).openDir("", .{ .iterate = true });
-    defer dir.close();
-    var walker = try dir.walk(b.allocator);
-    defer walker.deinit();
+    {
+        var dir = try math_dep.path("src").getPath3(b, null).openDir("", .{ .iterate = true });
+        defer dir.close();
+        var walker = try dir.walk(b.allocator);
+        defer walker.deinit();
 
-    while (try walker.next()) |entry| {
-        if (std.mem.endsWith(u8, entry.basename, ".c")) {
-            const path = try entry.dir.realpathAlloc(b.allocator, entry.basename);
-            bearssl.root_module.addCSourceFile(.{ .file = .{ .cwd_relative = path } });
-            b.allocator.free(path);
+        while (try walker.next()) |entry| {
+            if (entry.kind == .file and
+                !std.mem.startsWith(u8, entry.path, "generators") and
+                std.mem.endsWith(u8, entry.basename, ".c"))
+            {
+                const absolute_path = try entry.dir.realpathAlloc(b.allocator, entry.basename);
+                math.root_module.addCSourceFile(.{ .file = .{ .cwd_relative = absolute_path } });
+                b.allocator.free(absolute_path);
+            }
+        }
+    }
+
+    const crypto_dep = b.dependency("libtomcrypt", .{});
+    const crypto = b.addLibrary(.{
+        .name = "libtomcrypt",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize }),
+    });
+
+    crypto.root_module.linkLibrary(math);
+    crypto.root_module.addIncludePath(math_dep.path("src/headers"));
+    crypto.root_module.addCMacro("TFM_DESC", "");
+
+    crypto.root_module.addIncludePath(crypto_dep.path("src/headers"));
+    crypto.root_module.addCMacro("LTC_SOURCE", "");
+
+    {
+        var dir = try crypto_dep.path("src").getPath3(b, null).openDir("", .{ .iterate = true });
+        defer dir.close();
+        var walker = try dir.walk(b.allocator);
+        defer walker.deinit();
+
+        while (try walker.next()) |entry| {
+            if (std.mem.endsWith(u8, entry.basename, ".c")) {
+                const absolute_path = try entry.dir.realpathAlloc(b.allocator, entry.basename);
+                crypto.root_module.addCSourceFile(.{ .file = .{ .cwd_relative = absolute_path } });
+                b.allocator.free(absolute_path);
+            }
         }
     }
 
@@ -75,8 +107,9 @@ pub fn build(b: *std.Build) !void {
         }),
     });
 
-    exe.root_module.linkLibrary(bearssl);
-    exe.root_module.addIncludePath(bearssl_dep.path("inc"));
+    exe.root_module.linkLibrary(crypto);
+    exe.root_module.addIncludePath(crypto_dep.path("src/headers"));
+    exe.root_module.addCMacro("TFM_DESC", "");
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default

@@ -32,9 +32,13 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .bearssl = .{
-            .url = "https://bearssl.org/bearssl-0.6.tar.gz",
-            .hash = "N-V-__8AAP0mNAAkyiY2ykjGvFxPCz3MG1hET12zva5TtOmP",
+        .libtomcrypt = .{
+            .url = "https://github.com/libtom/libtomcrypt/releases/download/v1.18.2/crypt-1.18.2.tar.xz",
+            .hash = "N-V-__8AAGbbfgCs-Uqjf9vXP8rvInvp8dPx_28XP5LJKpfo",
+        },
+        .tomsfastmath = .{
+            .url = "https://github.com/libtom/tomsfastmath/releases/download/v0.13.1/tfm-0.13.1.tar.xz",
+            .hash = "N-V-__8AAGs7HgAxOXTQoAc98yC0MR3GgmDqzLryhjddloZT",
         },
     },
     // Specifies the set of files and directories that are included in this package.
