@@ -21,6 +21,8 @@ pub fn build(b: *std.Build) !void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
+    const io = b.graph.io;
+
     const math_dep = b.dependency("tomsfastmath", .{});
     const math = b.addLibrary(.{
         .name = "tomsfastmath",
@@ -30,19 +32,18 @@ pub fn build(b: *std.Build) !void {
     math.root_module.addIncludePath(math_dep.path("src/headers"));
 
     {
-        var dir = try math_dep.path("src").getPath3(b, null).openDir("", .{ .iterate = true });
-        defer dir.close();
-        var walker = try dir.walk(b.allocator);
+        var dir = try (try math_dep.path("src").getPath4(b, null)).openDir(io, "", .{ .iterate = true });
+        defer dir.close(io);
+        var walker = try dir.walkSelectively(b.allocator);
         defer walker.deinit();
 
-        while (try walker.next()) |entry| {
-            if (entry.kind == .file and
-                !std.mem.startsWith(u8, entry.path, "generators") and
-                std.mem.endsWith(u8, entry.basename, ".c"))
-            {
-                const absolute_path = try entry.dir.realpathAlloc(b.allocator, entry.basename);
-                math.root_module.addCSourceFile(.{ .file = .{ .cwd_relative = absolute_path } });
-                b.allocator.free(absolute_path);
+        while (try walker.next(io)) |entry| {
+            if (entry.kind == .directory and !std.mem.eql(u8, entry.basename, "generators")) {
+                try walker.enter(io, entry);
+            } else if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".c")) {
+                const path = try entry.dir.realPathFileAlloc(io, entry.basename, b.allocator);
+                math.root_module.addCSourceFile(.{ .file = .{ .cwd_relative = path } });
+                b.allocator.free(path);
             }
         }
     }
@@ -61,19 +62,23 @@ pub fn build(b: *std.Build) !void {
     crypto.root_module.addCMacro("LTC_SOURCE", "");
 
     {
-        var dir = try crypto_dep.path("src").getPath3(b, null).openDir("", .{ .iterate = true });
-        defer dir.close();
+        var dir = try (try crypto_dep.path("src").getPath4(b, null)).openDir(io, "", .{ .iterate = true });
+        defer dir.close(io);
         var walker = try dir.walk(b.allocator);
         defer walker.deinit();
 
-        while (try walker.next()) |entry| {
-            if (std.mem.endsWith(u8, entry.basename, ".c")) {
-                const absolute_path = try entry.dir.realpathAlloc(b.allocator, entry.basename);
-                crypto.root_module.addCSourceFile(.{ .file = .{ .cwd_relative = absolute_path } });
-                b.allocator.free(absolute_path);
+        while (try walker.next(io)) |entry| {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".c")) {
+                const path = try entry.dir.realPathFileAlloc(io, entry.basename, b.allocator);
+                crypto.root_module.addCSourceFile(.{ .file = .{ .cwd_relative = path } });
+                b.allocator.free(path);
             }
         }
     }
+
+    const c = b.addTranslateC(.{ .root_source_file = b.path("src/c.h"), .target = target, .optimize = optimize });
+    c.addIncludePath(crypto_dep.path("src/headers"));
+    c.defineCMacro("TFM_DESC", null);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -104,12 +109,11 @@ pub fn build(b: *std.Build) !void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "c", .module = c.createModule() }},
         }),
     });
 
     exe.root_module.linkLibrary(crypto);
-    exe.root_module.addIncludePath(crypto_dep.path("src/headers"));
-    exe.root_module.addCMacro("TFM_DESC", "");
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
