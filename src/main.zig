@@ -77,25 +77,12 @@ const EncString = struct {
         encryptedString: []const u8,
         encryptionType: u8 = 2,
         data: []const u8,
-        iv: []const u8,
-        mac: []const u8,
+        iv: [24]u8,
+        mac: [44]u8,
     };
 
     fields: Fields,
     arena: ?heap.ArenaAllocator = null,
-
-    fn init(allocator: mem.Allocator, v: Self) !Self {
-        const arena = heap.ArenaAllocator.init(allocator);
-        const alloc = arena.allocator();
-        return .{
-            .encryptedString = try alloc.dupe(u8, v.encryptedString),
-            .encryptionType = v.encryptionType,
-            .data = try alloc.dupe(u8, v.data),
-            .iv = try alloc.dupe(u8, v.iv),
-            .mac = try alloc.dupe(u8, v.iv),
-            .arena = arena,
-        };
-    }
 
     fn deinit(self: *const Self) void {
         self.arena.?.deinit();
@@ -152,15 +139,15 @@ fn decryptMessage(
 ) !json.Parsed(Receive) {
     const enc_key = key[0..32];
 
-    const iv = try base64Decode(allocator, encrypted.iv);
-    defer allocator.free(iv);
+    var iv: [16]u8 = undefined;
+    try base64.standard.Decoder.decode(&iv, &encrypted.iv);
 
     const message = try base64Decode(allocator, encrypted.data);
     defer allocator.free(message);
 
     var err = c.CRYPT_OK;
     var cbc: c.symmetric_CBC = undefined;
-    err = c.cbc_start(c.find_cipher("aes"), iv.ptr, enc_key, enc_key.len, 14, &cbc);
+    err = c.cbc_start(c.find_cipher("aes"), &iv, enc_key, enc_key.len, 14, &cbc);
     if (err != c.CRYPT_OK) {
         log.err("decryptMessage: {s}", .{c.error_to_string(err)});
         return error.DecryptMessage;
@@ -227,9 +214,13 @@ fn encryptMessage(allocator: mem.Allocator, io: Io, message: SendInner, key: *co
     var arena = heap.ArenaAllocator.init(allocator);
     const alloc = arena.allocator();
 
-    const encoded_iv = try base64Encode(alloc, &iv);
+    var encoded_iv: [24]u8 = undefined;
+    _ = base64.standard.Encoder.encode(&encoded_iv, &iv);
+
     const encoded_message = try base64Encode(alloc, bytes);
-    const encoded_mac = try base64Encode(alloc, &mac);
+
+    var encoded_mac: [44]u8 = undefined;
+    _ = base64.standard.Encoder.encode(&encoded_mac, &mac);
 
     return .{
         .fields = .{
