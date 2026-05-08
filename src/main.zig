@@ -42,31 +42,23 @@ pub fn main(init: process.Init) !void {
                 try setupEncryption(allocator, io, &message.value, wrapper.value.appId);
             }
         } else {
-            const encrypted = try json.parseFromValue(
+            const enc = try json.parseFromValue(
                 EncString.Fields,
                 allocator,
                 wrapper.value.message,
                 .{ .ignore_unknown_fields = true },
             );
-            defer encrypted.deinit();
+            defer enc.deinit();
 
-            const message = try decryptMessage(allocator, &encrypted.value, &session_key);
+            const message = try decryptMessage(allocator, &enc.value, &session_key);
             defer message.deinit();
 
             if (mem.eql(u8, message.value.command, "getBiometricsStatus")) {
-                const encrypted_send = try encryptMessage(allocator, io, .{
+                try sendInner(allocator, io, .{
                     .command = message.value.command,
                     .messageId = message.value.messageId,
                     .response = .{ .integer = 0 },
-                    .timestamp = Io.Clock.real.now(io).toMilliseconds(),
-                }, &session_key);
-                defer encrypted_send.deinit();
-
-                try sendMessage(allocator, .{
-                    .appId = wrapper.value.appId,
-                    .messageId = message.value.messageId,
-                    .message = encrypted_send.fields,
-                });
+                }, wrapper.value.appId);
             }
         }
     }
@@ -108,7 +100,7 @@ const Send = struct {
     message: ?EncString.Fields = null,
 };
 
-const SendInner = struct { command: []const u8, messageId: i32, response: json.Value, timestamp: i64 };
+const SendInner = struct { command: []const u8, messageId: i32, response: json.Value, timestamp: i64 = 0 };
 
 fn setupEncryption(allocator: mem.Allocator, io: Io, message: *const Receive, appId: []const u8) !void {
     var public_key: [294]u8 = undefined;
@@ -125,7 +117,7 @@ fn setupEncryption(allocator: mem.Allocator, io: Io, message: *const Receive, ap
     const encoded = try base64Encode(allocator, ciphertext);
     defer allocator.free(encoded);
 
-    try sendMessage(allocator, .{
+    try send(allocator, .{
         .appId = appId,
         .messageId = -1,
         .command = message.command,
@@ -189,10 +181,20 @@ fn encryptMessage(allocator: mem.Allocator, io: Io, message: SendInner, key: *co
     };
 }
 
+fn sendInner(allocator: mem.Allocator, io: Io, message: SendInner, appId: []const u8) !void {
+    var mut = message;
+    mut.timestamp = Io.Clock.real.now(io).toMilliseconds();
+
+    const enc = try encryptMessage(allocator, io, mut, &session_key);
+    defer enc.deinit();
+
+    try send(allocator, .{ .appId = appId, .messageId = mut.messageId, .message = enc.fields });
+}
+
 var stdout_buf: [1024]u8 = undefined;
 var stdout_writer: Io.File.Writer = undefined;
 
-fn sendMessage(allocator: mem.Allocator, message: Send) !void {
+fn send(allocator: mem.Allocator, message: Send) !void {
     const encoded = try json.Stringify.valueAlloc(allocator, message, .{});
     defer allocator.free(encoded);
 
