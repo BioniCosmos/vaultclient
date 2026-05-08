@@ -111,8 +111,8 @@ const Send = struct {
 const SendInner = struct { command: []const u8, messageId: i32, response: json.Value, timestamp: i64 };
 
 fn setupEncryption(allocator: mem.Allocator, io: Io, message: *const Receive, appId: []const u8) !void {
-    const public_key = try base64Decode(allocator, message.publicKey.?);
-    defer allocator.free(public_key);
+    var public_key: [294]u8 = undefined;
+    try base64.standard.Decoder.decode(&public_key, message.publicKey.?);
 
     var secret: [64]u8 = undefined;
     io.random(&secret);
@@ -120,7 +120,7 @@ fn setupEncryption(allocator: mem.Allocator, io: Io, message: *const Receive, ap
     log.debug("key: {s}", .{fmt.bytesToHex(secret, .lower)});
 
     var ciphertext_store: [512]u8 = undefined;
-    const ciphertext = try rsaEncrypt(&secret, public_key, &ciphertext_store);
+    const ciphertext = try rsaEncrypt(&secret, &public_key, &ciphertext_store);
 
     const encoded = try base64Encode(allocator, ciphertext);
     defer allocator.free(encoded);
@@ -149,7 +149,7 @@ fn decryptMessage(allocator: mem.Allocator, enc: *const EncString.Fields, key: *
 }
 
 fn encryptMessage(allocator: mem.Allocator, io: Io, message: SendInner, key: *const [64]u8) !EncString {
-    const json_encoded = try fmt.allocPrint(allocator, "{f}", .{json.fmt(message, .{})});
+    const json_encoded = try json.Stringify.valueAlloc(allocator, message, .{});
     defer allocator.free(json_encoded);
 
     const enc_key = key[0..32];
@@ -193,7 +193,7 @@ var stdout_buf: [1024]u8 = undefined;
 var stdout_writer: Io.File.Writer = undefined;
 
 fn sendMessage(allocator: mem.Allocator, message: Send) !void {
-    const encoded = try fmt.allocPrint(allocator, "{f}", .{json.fmt(message, .{})});
+    const encoded = try json.Stringify.valueAlloc(allocator, message, .{});
     defer allocator.free(encoded);
 
     if (encoded.len > math.maxInt(u32)) {
@@ -204,6 +204,17 @@ fn sendMessage(allocator: mem.Allocator, message: Send) !void {
     log.info("send: {s}", .{encoded});
     try stdout_writer.interface.writeAll(encoded);
     try stdout_writer.interface.flush();
+}
+
+fn base64Encode(allocator: mem.Allocator, raw: []const u8) ![]const u8 {
+    const encoded = try allocator.alloc(u8, base64.standard.Encoder.calcSize(raw.len));
+    return base64.standard.Encoder.encode(encoded, raw);
+}
+
+fn base64Decode(allocator: mem.Allocator, encoded: []const u8) ![]const u8 {
+    const raw = try allocator.alloc(u8, try base64.standard.Decoder.calcSizeForSlice(encoded));
+    try base64.standard.Decoder.decode(raw, encoded);
+    return raw;
 }
 
 // crypto utilities
@@ -328,17 +339,6 @@ fn pkcs7Unpad(data: []const u8) CryptoError![]const u8 {
         return CryptoError.InvalidPadding;
     }
     return data[0..start];
-}
-
-fn base64Encode(allocator: mem.Allocator, raw: []const u8) ![]const u8 {
-    const encoded = try allocator.alloc(u8, base64.standard.Encoder.calcSize(raw.len));
-    return base64.standard.Encoder.encode(encoded, raw);
-}
-
-fn base64Decode(allocator: mem.Allocator, encoded: []const u8) ![]const u8 {
-    const raw = try allocator.alloc(u8, try base64.standard.Decoder.calcSizeForSlice(encoded));
-    try base64.standard.Decoder.decode(raw, encoded);
-    return raw;
 }
 
 fn initCrypto() !void {
