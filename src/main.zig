@@ -10,6 +10,7 @@ const log = std.log;
 const math = std.math;
 const mem = std.mem;
 const process = std.process;
+const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 
 const c = @import("c");
 
@@ -132,92 +133,43 @@ fn setupEncryption(allocator: mem.Allocator, io: Io, message: *const Receive, ap
     });
 }
 
-fn decryptMessage(
-    allocator: mem.Allocator,
-    encrypted: *const EncString.Fields,
-    key: *const [64]u8,
-) !json.Parsed(Receive) {
+fn decryptMessage(allocator: mem.Allocator, enc: *const EncString.Fields, key: *const [64]u8) !json.Parsed(Receive) {
     const enc_key = key[0..32];
 
     var iv: [16]u8 = undefined;
-    try base64.standard.Decoder.decode(&iv, &encrypted.iv);
+    try base64.standard.Decoder.decode(&iv, &enc.iv);
 
-    const message = try base64Decode(allocator, encrypted.data);
-    defer allocator.free(message);
+    const encrypted_bytes = try base64Decode(allocator, enc.data);
+    defer allocator.free(encrypted_bytes);
 
-    var err = c.CRYPT_OK;
-    var cbc: c.symmetric_CBC = undefined;
-    err = c.cbc_start(c.find_cipher("aes"), &iv, enc_key, enc_key.len, 14, &cbc);
-    if (err != c.CRYPT_OK) {
-        log.err("decryptMessage: {s}", .{c.error_to_string(err)});
-        return error.DecryptMessage;
-    }
+    const json_encoded = try aesDecrypt(@constCast(encrypted_bytes), enc_key, &iv);
+    log.info("decrypted: {s}", .{json_encoded});
 
-    err = c.cbc_decrypt(message.ptr, @constCast(message.ptr), message.len, &cbc);
-    if (err != c.CRYPT_OK) {
-        log.err("decryptMessage: {s}", .{c.error_to_string(err)});
-        return error.DecryptMessage;
-    }
-
-    err = c.cbc_done(&cbc);
-    if (err != c.CRYPT_OK) {
-        log.err("decryptMessage: {s}", .{c.error_to_string(err)});
-        return error.DecryptMessage;
-    }
-
-    const unpadded = try unpadPKCS7(message);
-    log.info("decrypted: {s}", .{unpadded});
-
-    return try json.parseFromSlice(Receive, allocator, unpadded, .{ .allocate = .alloc_always });
+    return try json.parseFromSlice(Receive, allocator, json_encoded, .{ .allocate = .alloc_always });
 }
 
 fn encryptMessage(allocator: mem.Allocator, io: Io, message: SendInner, key: *const [64]u8) !EncString {
+    const json_encoded = try fmt.allocPrint(allocator, "{f}", .{json.fmt(message, .{})});
+    defer allocator.free(json_encoded);
+
     const enc_key = key[0..32];
     const auth_key = key[32..];
 
     var iv: [16]u8 = undefined;
     io.random(&iv);
 
-    const encoded = try fmt.allocPrint(allocator, "{f}", .{json.fmt(message, .{})});
-    defer allocator.free(encoded);
+    const encrypted = try aesEncrypt(allocator, json_encoded, enc_key, &iv);
+    defer allocator.free(encrypted);
 
-    const bytes = try padPKCS7(allocator, encoded);
-    defer allocator.free(bytes);
-
-    var err = c.CRYPT_OK;
-    var cbc: c.symmetric_CBC = undefined;
-    err = c.cbc_start(c.find_cipher("aes"), &iv, enc_key, enc_key.len, 14, &cbc);
-    if (err != c.CRYPT_OK) {
-        log.err("decryptMessage: {s}", .{c.error_to_string(err)});
-        return error.DecryptMessage;
-    }
-
-    err = c.cbc_encrypt(bytes.ptr, @constCast(bytes.ptr), bytes.len, &cbc);
-    if (err != c.CRYPT_OK) {
-        log.err("decryptMessage: {s}", .{c.error_to_string(err)});
-        return error.DecryptMessage;
-    }
-
-    err = c.cbc_done(&cbc);
-    if (err != c.CRYPT_OK) {
-        log.err("decryptMessage: {s}", .{c.error_to_string(err)});
-        return error.DecryptMessage;
-    }
-
-    const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
-    var mac: [HmacSha256.mac_length]u8 = undefined;
-    var hmac = HmacSha256.init(auth_key);
-    hmac.update(&iv);
-    hmac.update(bytes);
-    hmac.final(&mac);
+    const mac = hmacGenerate(&.{ &iv, encrypted }, auth_key);
 
     var arena = heap.ArenaAllocator.init(allocator);
     const alloc = arena.allocator();
 
+    const base64_encoded_encrypted = try base64Encode(alloc, encrypted);
+
     var encoded_iv: [24]u8 = undefined;
     _ = base64.standard.Encoder.encode(&encoded_iv, &iv);
-
-    const encoded_message = try base64Encode(alloc, bytes);
 
     var encoded_mac: [44]u8 = undefined;
     _ = base64.standard.Encoder.encode(&encoded_mac, &mac);
@@ -227,9 +179,9 @@ fn encryptMessage(allocator: mem.Allocator, io: Io, message: SendInner, key: *co
             .encryptedString = try fmt.allocPrint(
                 alloc,
                 "2.{s}|{s}|{s}",
-                .{ encoded_iv, encoded_message, encoded_mac },
+                .{ encoded_iv, base64_encoded_encrypted, encoded_mac },
             ),
-            .data = encoded_message,
+            .data = base64_encoded_encrypted,
             .iv = encoded_iv,
             .mac = encoded_mac,
         },
@@ -254,20 +206,24 @@ fn sendMessage(allocator: mem.Allocator, message: Send) !void {
     try stdout_writer.interface.flush();
 }
 
-fn rsaEncrypt(plaintext: []const u8, public_key: []const u8, ciphertext: []u8) ![]const u8 {
+// crypto utilities
+
+const CryptoError = error{ Encryption, Decryption, InvalidPadding, InvalidKey } || mem.Allocator.Error;
+
+fn rsaEncrypt(plaintext: []const u8, public_key: []const u8, ciphertext_buf: []u8) CryptoError![]const u8 {
     var err = c.CRYPT_OK;
     var key: c.rsa_key = undefined;
     err = c.rsa_import(public_key.ptr, public_key.len, &key);
     if (err != c.CRYPT_OK) {
         log.err("rsaEncrypt: {s}", .{c.error_to_string(err)});
-        return error.DecodeKey;
+        return CryptoError.InvalidKey;
     }
 
-    var ciphertext_len = ciphertext.len;
+    var ciphertext_len = ciphertext_buf.len;
     err = c.rsa_encrypt_key(
         plaintext.ptr,
         plaintext.len,
-        ciphertext.ptr,
+        ciphertext_buf.ptr,
         &ciphertext_len,
         null,
         0,
@@ -278,35 +234,100 @@ fn rsaEncrypt(plaintext: []const u8, public_key: []const u8, ciphertext: []u8) !
     );
     if (err != c.CRYPT_OK) {
         log.err("rsaEncrypt: {s}", .{c.error_to_string(err)});
-        return error.Encrypt;
+        return CryptoError.Encryption;
     }
 
-    return ciphertext[0..ciphertext_len];
+    return ciphertext_buf[0..ciphertext_len];
 }
 
-fn unpadPKCS7(data: []const u8) ![]const u8 {
+fn aesEncrypt(
+    allocator: mem.Allocator,
+    plaintext: []const u8,
+    key: *const [32]u8,
+    iv: *const [16]u8,
+) CryptoError![]const u8 {
+    const ciphertext = try pkcs7Pad(allocator, plaintext);
+    var err = c.CRYPT_OK;
+
+    var cbc: c.symmetric_CBC = undefined;
+    err = c.cbc_start(c.find_cipher("aes"), iv, key, key.len, 14, &cbc);
+    if (err != c.CRYPT_OK) {
+        log.err("aesEncrypt: {s}", .{c.error_to_string(err)});
+        return CryptoError.Encryption;
+    }
+
+    err = c.cbc_encrypt(ciphertext.ptr, @constCast(ciphertext.ptr), ciphertext.len, &cbc);
+    if (err != c.CRYPT_OK) {
+        log.err("aesEncrypt: {s}", .{c.error_to_string(err)});
+        return CryptoError.Encryption;
+    }
+
+    err = c.cbc_done(&cbc);
+    if (err != c.CRYPT_OK) {
+        log.err("aesEncrypt: {s}", .{c.error_to_string(err)});
+        return CryptoError.Encryption;
+    }
+
+    return ciphertext;
+}
+
+fn aesDecrypt(ciphertext: []u8, key: *const [32]u8, iv: *const [16]u8) CryptoError![]const u8 {
+    var err = c.CRYPT_OK;
+    var cbc: c.symmetric_CBC = undefined;
+    err = c.cbc_start(c.find_cipher("aes"), iv, key, key.len, 14, &cbc);
+    if (err != c.CRYPT_OK) {
+        log.err("aesDecrypt: {s}", .{c.error_to_string(err)});
+        return CryptoError.Decryption;
+    }
+
+    err = c.cbc_decrypt(ciphertext.ptr, ciphertext.ptr, ciphertext.len, &cbc);
+    if (err != c.CRYPT_OK) {
+        log.err("aesDecrypt: {s}", .{c.error_to_string(err)});
+        return CryptoError.Decryption;
+    }
+
+    err = c.cbc_done(&cbc);
+    if (err != c.CRYPT_OK) {
+        log.err("aesDecrypt: {s}", .{c.error_to_string(err)});
+        return CryptoError.Decryption;
+    }
+
+    return pkcs7Unpad(ciphertext);
+}
+
+fn hmacGenerate(payload: []const []const u8, key: []const u8) [HmacSha256.mac_length]u8 {
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    var hmac = HmacSha256.init(key);
+    for (payload) |x| {
+        hmac.update(x);
+    }
+    hmac.final(&mac);
+    return mac;
+}
+
+fn pkcs7Pad(allocator: mem.Allocator, data: []const u8) CryptoError![]const u8 {
+    const len = 16 - data.len % 16;
+    const padded = try allocator.alloc(u8, data.len + len);
+    @memcpy(padded[0..data.len], data);
+    @memset(padded[data.len..], @intCast(len));
+    return padded;
+}
+
+fn pkcs7Unpad(data: []const u8) CryptoError![]const u8 {
     if (data.len == 0) {
         return data;
     }
 
     const len = data[data.len - 1];
     if (len == 0 or len > data.len) {
-        return error.InvalidPadding;
+        return CryptoError.InvalidPadding;
     }
 
     const start = data.len - len;
     if (!mem.allEqual(u8, data[start..], len)) {
-        return error.InvalidPadding;
+        return CryptoError.InvalidPadding;
     }
     return data[0..start];
-}
-
-fn padPKCS7(allocator: mem.Allocator, data: []const u8) ![]const u8 {
-    const len = 16 - data.len % 16;
-    const padded = try allocator.alloc(u8, data.len + len);
-    @memcpy(padded[0..data.len], data);
-    @memset(padded[data.len..], @intCast(len));
-    return padded;
 }
 
 fn base64Encode(allocator: mem.Allocator, raw: []const u8) ![]const u8 {
