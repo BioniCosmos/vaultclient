@@ -53,11 +53,23 @@ pub fn main(init: process.Init) !void {
             const message = try decryptMessage(allocator, &enc.value, &session_key);
             defer message.deinit();
 
-            if (mem.eql(u8, message.value.command, "getBiometricsStatus")) {
+            if (mem.eql(u8, message.value.command, "getBiometricsStatus") or
+                mem.eql(u8, message.value.command, "getBiometricsStatusForUser"))
+            {
                 try sendInner(allocator, io, .{
                     .command = message.value.command,
                     .messageId = message.value.messageId,
                     .response = .{ .integer = 0 },
+                }, wrapper.value.appId);
+            } else if (mem.eql(u8, message.value.command, "unlockWithBiometricsForUser")) {
+                const userKey = try readUserKey(allocator);
+                defer allocator.free(userKey);
+
+                try sendInner(allocator, io, .{
+                    .command = message.value.command,
+                    .messageId = message.value.messageId,
+                    .response = .{ .bool = true },
+                    .userKeyB64 = userKey,
                 }, wrapper.value.appId);
             }
         }
@@ -100,7 +112,13 @@ const Send = struct {
     message: ?EncString.Fields = null,
 };
 
-const SendInner = struct { command: []const u8, messageId: i32, response: json.Value, timestamp: i64 = 0 };
+const SendInner = struct {
+    command: []const u8,
+    messageId: i32,
+    response: json.Value,
+    timestamp: i64 = 0,
+    userKeyB64: ?[]const u8 = null,
+};
 
 fn setupEncryption(allocator: mem.Allocator, io: Io, message: *const Receive, appId: []const u8) !void {
     var public_key: [294]u8 = undefined;
@@ -123,6 +141,38 @@ fn setupEncryption(allocator: mem.Allocator, io: Io, message: *const Receive, ap
         .command = message.command,
         .sharedSecret = encoded,
     });
+}
+
+fn readUserKey(allocator: mem.Allocator) ![]const u8 {
+    var keys = [_]?*const anyopaque{ c.kSecClass, c.kSecAttrLabel, c.kSecReturnData };
+    var values = [_]?*const anyopaque{ c.kSecClassGenericPassword, c.CFSTR("Bitwarden_biometric"), c.kCFBooleanTrue };
+    const query = c.CFDictionaryCreate(null, &keys, &values, 3, null, null);
+    defer c.CFRelease(query);
+
+    var item: c.CFTypeRef = null;
+    defer if (item) |_| {
+        c.CFRelease(item);
+    };
+
+    const status = c.SecItemCopyMatching(query, &item);
+    if (status == c.errSecItemNotFound) {
+        return error.SecretNotFound;
+    }
+    if (status != c.errSecSuccess) {
+        const err = c.SecCopyErrorMessageString(status, c.nil);
+        defer c.CFRelease(err);
+
+        var buf: [256]u8 = undefined;
+        if (c.CFStringGetCString(err, &buf, buf.len, c.kCFStringEncodingUTF8) == c.true) {
+            log.err("readSecret: {s}", .{mem.sliceTo(&buf, 0)});
+        } else {
+            log.err("readSecret: {}", .{status});
+        }
+
+        return error.SecretQuery;
+    }
+
+    return allocator.dupe(u8, mem.span(c.CFDataGetBytePtr(@ptrCast(@alignCast(item)))));
 }
 
 fn decryptMessage(allocator: mem.Allocator, enc: *const EncString.Fields, key: *const [64]u8) !json.Parsed(Receive) {

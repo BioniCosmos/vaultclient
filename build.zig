@@ -79,6 +79,7 @@ pub fn build(b: *std.Build) !void {
     const c = b.addTranslateC(.{ .root_source_file = b.path("src/c.h"), .target = target, .optimize = optimize });
     c.addIncludePath(crypto_dep.path("src/headers"));
     c.defineCMacro("TFM_DESC", null);
+    c.defineCMacro("_Nonnull", "");
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -114,6 +115,8 @@ pub fn build(b: *std.Build) !void {
     });
 
     exe.root_module.linkLibrary(crypto);
+    exe.root_module.linkFramework("CoreFoundation", .{});
+    exe.root_module.linkFramework("Security", .{});
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
