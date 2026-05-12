@@ -116,7 +116,9 @@ pub fn build(b: *std.Build) !void {
 
     exe.root_module.linkLibrary(crypto);
     exe.root_module.linkFramework("CoreFoundation", .{});
+    exe.root_module.linkFramework("LocalAuthentication", .{});
     exe.root_module.linkFramework("Security", .{});
+    exe.root_module.addCSourceFile(.{ .file = b.path("src/biometric.m"), .flags = &.{ "-fmodules", "-fobjc-arc" } });
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default

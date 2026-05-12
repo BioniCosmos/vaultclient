@@ -2,3 +2,5 @@
 zig-out
 zig-pkg
 *.log
+.clangd
+.clang-format

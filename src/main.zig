@@ -62,6 +62,14 @@ pub fn main(init: process.Init) !void {
                     .response = .{ .integer = 0 },
                 }, wrapper.value.appId);
             } else if (mem.eql(u8, message.value.command, "unlockWithBiometricsForUser")) {
+                var auth = BiometricAuth{ .io = io };
+                c.perform_biometric_auth(&BiometricAuth.afterAuth, &auth);
+                auth.wait();
+                if (auth.err) |err| {
+                    log.err("unlock: {s}", .{err});
+                    continue;
+                }
+
                 const userKey = try readUserKey(allocator);
                 defer allocator.free(userKey);
 
@@ -142,6 +150,29 @@ fn setupEncryption(allocator: mem.Allocator, io: Io, message: *const Receive, ap
         .sharedSecret = encoded,
     });
 }
+
+const BiometricAuth = struct {
+    const Self = @This();
+
+    io: Io,
+    semaphore: Io.Semaphore = Io.Semaphore{},
+    err_buf: [256]u8 = undefined,
+    err: ?[]const u8 = null,
+
+    pub export fn afterAuth(any: ?*anyopaque, err_message: ?[*:0]const u8) void {
+        const self: *Self = @ptrCast(@alignCast(any));
+        if (err_message) |err| {
+            const err_slice = mem.span(err);
+            @memcpy(self.err_buf[0..err_slice.len], err_slice);
+            self.err = self.err_buf[0..err_slice.len];
+        }
+        self.semaphore.post(self.io);
+    }
+
+    pub fn wait(self: *Self) void {
+        self.semaphore.waitUncancelable(self.io);
+    }
+};
 
 fn readUserKey(allocator: mem.Allocator) ![]const u8 {
     var keys = [_]?*const anyopaque{ c.kSecClass, c.kSecAttrLabel, c.kSecReturnData };
